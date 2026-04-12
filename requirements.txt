@@ -1,0 +1,40 @@
+# GitHub Code Analysis Agent
+
+# LLM & Embedding
+openai>=1.0.0
+deepseek>=0.1.0
+
+# Embedding 本地部署（可选）
+sentence-transformers>=2.2.0  # HuggingFace Embedding（免费开源，推荐）
+# ollama>=0.1.0  # Ollama 本地部署
+# transformers>=4.0.0
+# torch>=2.0.0
+
+# 向量数据库
+chromadb>=0.4.0
+
+# GitHub API
+PyGithub>=1.58.0
+
+# AST 解析
+tree-sitter>=0.20.0
+tree-sitter-languages>=1.8.0
+
+# 环境变量
+python-dotenv>=1.0.0
+
+# Web 界面
+streamlit>=1.28.0
+
+# CLI 交互
+# InquirerPy>=0.3.0  # 可选，增强交互体验
+
+# Git 操作
+GitPython>=3.1.0
+
+# 日志
+loguru>=0.7.0
+
+# 测试
+pytest>=7.4.0
+pytest-cov>=4.1.0

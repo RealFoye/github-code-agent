@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Data directories (large binary data)
+data/repos/
+data/chromadb/
+
+# Environment
+.env
+
+# Logs
+*.log
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Embedded git repos
+data/repos/
+
+# Notes and temp files
+"4.12 笔记.md"
+*.md.bak

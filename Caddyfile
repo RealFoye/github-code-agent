@@ -1,0 +1,13 @@
+# Caddyfile - Streamlit 生产部署配置
+
+# 本地开发/测试用
+localhost {
+    reverse_proxy /ws* localhost:8501
+    reverse_proxy /* localhost:8501
+}
+
+# 如果用 ngrok 或公网访问，取消下面的注释并改成你的域名
+# your-ngrok-url.ngrok-free.app {
+#     reverse_proxy /ws* localhost:8501
+#     reverse_proxy /* localhost:8501
+# }
