@@ -434,8 +434,13 @@ class LLMRelevanceRanker:
         # 调用 LLM
         try:
             evaluation = self._call_llm(prompt)
-            cards = self._parse_evaluation(repos, evaluation)
-            logger.info(f"LLM 评估完成，返回 {len(cards)} 个推荐")
+            logger.info(f"LLM 返回原始内容长度: {len(evaluation)} 字符")
+
+            # 记录 LLM 返回内容前 500 字符（用于调试 JSON 解析问题）
+            logger.debug(f"LLM 原始返回（前500字符）: {evaluation[:500]}")
+
+            cards, matched_count = self._parse_evaluation(repos, evaluation)
+            logger.info(f"LLM 评估完成，返回 {len(cards)} 个推荐，matched_count={matched_count}")
 
             # 记录评分证据
             for card in cards:
@@ -447,10 +452,19 @@ class LLMRelevanceRanker:
                         f"excluded={card.evidence.get('domain_excluded')}"
                     )
 
+            # 显式 fallback 条件：matched_count == 0 或 所有 score 都是 0.0
+            all_zero = all(c.relevance_score == 0.0 for c in cards) if cards else True
+            if matched_count == 0 or all_zero:
+                logger.warning(
+                    f"matched_count={matched_count}, all_zero={all_zero}，"
+                    f"显式触发 fallback 到 star-based ranking"
+                )
+                return self._fallback_ranking(repos, intent)
+
             return cards
 
         except Exception as e:
-            logger.error(f"LLM 评估失败: {e}")
+            logger.error(f"LLM 评估失败: {e}，触发 fallback 到 star-based ranking")
             # 降级：使用基础分数排序
             return self._fallback_ranking(repos, intent)
 
@@ -616,11 +630,17 @@ class LLMRelevanceRanker:
 以下是候选仓库：
 {repos_text}
 
+【输出规则——必须严格遵守】
+- full_name 必须从候选仓库列表中选取，不允许编造或使用模板占位符（如 "owner/repo"）
+- 每个 full_name 必须逐字匹配列表中的某一仓库
+- 如果某个仓库无法评估，可以省略，但不要使用任何未在列表中出现过的 full_name
+- 只输出 JSON，不要包含任何解释或说明文字
+
 请返回 JSON：
 {{
   "evaluations": [
     {{
-      "full_name": "owner/repo",
+      "full_name": "候选仓库的完整名称（必须与上述列表中的 full_name 完全一致）",
       "intent_fit": 0.0~1.0,
       "observable_quality": 0.0~1.0,
       "preference_bonus": 0.0~0.15,
@@ -809,12 +829,30 @@ class LLMRelevanceRanker:
         self,
         repos: List[Dict[str, Any]],
         evaluation: str,
-    ) -> List[RepoCard]:
-        """解析 LLM 评估结果"""
+    ) -> Tuple[List[RepoCard], int]:
+        """
+        解析 LLM 评估结果。
+
+        Returns:
+            Tuple of (cards, matched_count) — matched_count 用于诊断
+        """
         import json
 
         # 尝试提取 JSON
         evaluations = {}
+        repo_full_names = {repo["full_name"] for repo in repos}  # 候选仓库 full_name 集合
+        repo_full_names_lower = {fn.lower(): fn for fn in repo_full_names}  # 大小写不敏感查找
+
+        # 检测模板占位符的 pattern
+        PLACEHOLDER_PATTERNS = (
+            "owner/repo", "username/reponame", "user/repo",
+            "owner/name", "user/repository", "某用户/某仓库",
+        )
+        is_placeholder = lambda fn: fn.lower() in PLACEHOLDER_PATTERNS
+
+        matched_count = 0
+        placeholder_detected = False
+
         try:
             # 查找 JSON 块
             json_match = re.search(r"\{[\s\S]*\}", evaluation)
@@ -822,14 +860,53 @@ class LLMRelevanceRanker:
                 raw_json = json_match.group()
                 try:
                     data = json.loads(raw_json)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
                     # 尝试清理后重新解析
+                    logger.debug(f"JSON 解析首次失败，尝试 cleanup: {e}")
                     cleaned_json = self._cleanup_json_string(raw_json)
                     data = json.loads(cleaned_json)
             else:
                 data = json.loads(evaluation)
 
-            evaluations = {e["full_name"]: e for e in data.get("evaluations", [])}
+            # 构建 evaluations 字典
+            raw_evaluations = data.get("evaluations", [])
+            logger.debug(f"LLM 返回 {len(raw_evaluations)} 个 evaluations")
+
+            # 详细诊断：检查 full_name 匹配情况
+            evaluations = {}
+            unmatched_full_names = []  # LLM 返回但不在候选中的 full_name
+            for e in raw_evaluations:
+                fn = e.get("full_name", "")
+
+                # 步骤1：检测模板占位符
+                if is_placeholder(fn):
+                    logger.warning(f"[placeholder_full_name] 检测到模板占位符 full_name: '{fn}'")
+                    placeholder_detected = True
+                    continue
+
+                # 步骤2：先不做精确匹配，先尝试大小写不敏感匹配
+                fn_lower = fn.lower()
+                actual_fn = repo_full_names_lower.get(fn_lower)
+
+                if actual_fn:
+                    # 候选中存在（大小写不敏感匹配成功）
+                    matched_count += 1
+                    evaluations[actual_fn] = e
+                else:
+                    # 不在候选列表中 → 可能是 gibberish 或乱码
+                    unmatched_full_names.append(fn)
+                    logger.warning(
+                        f"[gibberish_full_name] LLM 返回了不在候选列表中的 full_name: '{fn}'"
+                    )
+
+            logger.debug(
+                f"Evaluations 匹配诊断: "
+                f"候选仓库数={len(repos)}, "
+                f"LLM 返回数={len(raw_evaluations)}, "
+                f"匹配数={matched_count}, "
+                f"未匹配LLM返回={unmatched_full_names[:5]}"
+            )
+
 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON 解析失败: {e}，使用降级排序")
@@ -868,7 +945,7 @@ class LLMRelevanceRanker:
         # 按相关性分数排序
         cards.sort(key=lambda c: c.relevance_score, reverse=True)
 
-        return cards
+        return cards, matched_count
 
     def _fallback_ranking(
         self,
