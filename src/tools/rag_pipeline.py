@@ -5,6 +5,7 @@ RAG 流程
 
 import logging
 import os
+import re
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -31,6 +32,79 @@ class RetrievedChunk:
     chunk: CodeChunk
     distance: float = 0.0
     score: float = 0.0
+
+
+def detect_tutorial_number(query: str) -> Optional[str]:
+    """
+    从查询中检测 tutorial 编号
+
+    支持格式：
+    - Tutorial 8 / Tutorial 08
+    - tutorial8 / tutorial08
+    - tutorial_8 / tutorial_08
+    - 第8章 / 第八章
+
+    Returns:
+        编号字符串（如 "8" 或 "08"），检测不到返回 None
+    """
+    # 阿拉伯数字：Tutorial 8 / tutorial8 / tutorial_8 / Tutorial08
+    patterns_arabic = [
+        r'tutorial[_\s]?0*(\d+)',
+        r'tutorial\s+0*(\d+)',
+    ]
+    for p in patterns_arabic:
+        m = re.search(p, query, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    # 中文：第8章 / 第八章
+    chinese_numbers = {'一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+                       '六': '6', '七': '7', '八': '8', '九': '9', '十': '10'}
+    m = re.search(r'第([一二三四五六七八九十]+)章', query)
+    if m:
+        cn = m.group(1)
+        if cn in chinese_numbers:
+            return chinese_numbers[cn]
+
+    return None
+
+
+def detect_query_intent(query: str) -> str:
+    """
+    检测查询的意图类型
+
+    Returns:
+        intent 字符串：
+        - "project_overview": 项目概览类问题
+        - "tutorial_detail": 特定章节/教程内容问题（由 detect_tutorial_number 进一步处理）
+        - "general": 一般问题
+    """
+    query_lower = query.lower().strip()
+
+    # 项目概览类 pattern
+    overview_patterns = [
+        r'^这个项目',
+        r'^项目是',
+        r'^这个仓库',
+        r'^仓库是',
+        r'项目简介',
+        r'项目概览',
+        r'项目描述',
+        r'有什么功能',
+        r'是干什么的',
+        r'是做什么的',
+        r'用来做什么',
+        r'怎么用',  # "怎么开始用这个项目"
+        r'如何使用',  # "如何使用这个项目"
+        r'快速开始',
+        r'快速入门',
+    ]
+
+    for p in overview_patterns:
+        if re.search(p, query_lower):
+            return "project_overview"
+
+    return "general"
 
 
 class EmbeddingService:
@@ -211,13 +285,13 @@ class RAGPipeline:
         logger.info(f"开始构建索引: {repo_path}")
 
         # 切片整个仓库
-        chunks = self.chunker.chunk_directory(repo_path)
+        chunks, stats = self.chunker.chunk_directory(repo_path)
 
         if not chunks:
             logger.warning("没有找到任何代码切片")
             return 0
 
-        logger.info(f"共 {len(chunks)} 个切片，开始向量化...")
+        logger.info(f"共 {len(chunks)} 个切片，统计: {stats}，开始向量化...")
 
         # 批量处理
         total_indexed = 0
@@ -238,17 +312,22 @@ class RAGPipeline:
         # 准备数据
         ids = [chunk.chunk_id for chunk in chunks]
         documents = [chunk.content for chunk in chunks]
-        metadatas = [
-            {
+        metadatas = []
+        for chunk in chunks:
+            metadata = {
                 "file_path": chunk.file_path,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
                 "chunk_type": chunk.chunk_type,
                 "name": chunk.name,
                 "language": chunk.language or "",
+                "heading_path": chunk.heading_path,
+                "imports": ",".join(chunk.imports) if chunk.imports else "",
             }
-            for chunk in chunks
-        ]
+            # notebook_cell_index 可能是 None，ChromaDB 不支持 None，转为 -1
+            if chunk.notebook_cell_index is not None:
+                metadata["notebook_cell_index"] = chunk.notebook_cell_index
+            metadatas.append(metadata)
 
         # 生成 embedding
         embeddings = self.embedding_service.embed(documents)
@@ -266,6 +345,7 @@ class RAGPipeline:
         query: str,
         top_k: int = RAG_TOP_K,
         filter_metadata: Optional[Dict[str, Any]] = None,
+        tutorial_hint: Optional[str] = None,
     ) -> List[RetrievedChunk]:
         """
         检索相关代码块
@@ -274,12 +354,19 @@ class RAGPipeline:
             query: 查询文本
             top_k: 返回数量
             filter_metadata: 元数据过滤条件
+            tutorial_hint: 检测到的 tutorial 编号，用于增强检索
 
         Returns:
             RetrievedChunk 列表
         """
+        # 如果有 tutorial_hint，追加英文关键词以改善跨语言检索
+        enhanced_query = query
+        if tutorial_hint:
+            # 追加 tutorial 编号的多种写法
+            enhanced_query = f"{query} tutorial{tutorial_hint} tutorial_{tutorial_hint} tutorial {tutorial_hint}"
+
         # 生成 query embedding
-        query_embedding = self.embedding_service.embed([query])[0]
+        query_embedding = self.embedding_service.embed([enhanced_query])[0]
 
         # 向量检索
         results = self.collection.query(
@@ -305,6 +392,9 @@ class RAGPipeline:
                     chunk_type=metadata.get("chunk_type", "unknown"),
                     name=metadata.get("name", ""),
                     language=metadata.get("language") or None,
+                    heading_path=metadata.get("heading_path", ""),
+                    notebook_cell_index=metadata.get("notebook_cell_index"),
+                    imports=metadata.get("imports", "").split(",") if metadata.get("imports") else [],
                 )
 
                 # 计算相似度分数 (distance 越小越相似)
@@ -323,6 +413,8 @@ class RAGPipeline:
         query: str,
         chunks: List[RetrievedChunk],
         top_k: int = RAG_RERANK_TOP_K,
+        tutorial_hint: Optional[str] = None,
+        query_intent: str = "general",
     ) -> List[RetrievedChunk]:
         """
         对检索结果重排序
@@ -331,6 +423,8 @@ class RAGPipeline:
             query: 查询文本
             chunks: 检索结果
             top_k: 返回数量
+            tutorial_hint: 检测到的 tutorial 编号，用于优先排序
+            query_intent: 查询意图类型（project_overview / tutorial_detail / general）
 
         Returns:
             重排序后的结果
@@ -340,11 +434,23 @@ class RAGPipeline:
 
         # 简单重排序：结合相关性和位置
         # 优先级：
-        # 1. chunk_type 匹配（function > class > module > file）
+        # 1. chunk_type 匹配（function > class > module > notebook_code > file）
         # 2. 文件路径包含关键词
         # 3. 原始相似度分数
 
-        type_priority = {"function": 0, "class": 1, "module": 2, "file": 3, "config": 4, "document": 5}
+        type_priority = {
+            "function": 0,
+            "class": 1,
+            "module": 2,
+            "notebook_code": 3,
+            "file": 4,
+            "config": 5,
+            "document": 6,
+            "notebook_markdown": 7,
+            "tutorial_markdown": 8,
+            "readme": 9,
+            "unknown": 99,
+        }
 
         def rerank_key(item: RetrievedChunk) -> Tuple[int, float, int]:
             chunk = item.chunk
@@ -360,10 +466,70 @@ class RAGPipeline:
             if chunk.name and query_lower in chunk.name.lower():
                 path_match += 1
 
+            # tutorial_hint 匹配加权（高优先级）
+            tutorial_match = 0
+            if tutorial_hint:
+                # 匹配格式：Tutorial08, tutorial08, Tutorial 8, tutorial_8 等
+                patterns = [
+                    f"tutorial{tutorial_hint.zfill(2)}",
+                    f"tutorial_{tutorial_hint.zfill(2)}",
+                    f"tutorial {tutorial_hint}",
+                    f"tutorial{tutorial_hint}",
+                    f"tutorial_{tutorial_hint}",
+                ]
+                fp_lower = chunk.file_path.lower()
+                hp_lower = chunk.heading_path.lower()
+                for p in patterns:
+                    if p in fp_lower or p in hp_lower:
+                        tutorial_match = 10  # 大幅加权
+                        break
+
+            # project_overview 意图：对源文件做优先级和降权
+            source_adjustment = 0
+            effective_type_priority = type_score  # 默认不变
+            if query_intent == "project_overview":
+                fp_lower = chunk.file_path.lower()
+
+                # 优先的源文件：大幅提升 README 类型 chunk 的有效优先级
+                # 注意：file_path 是完整路径如 /Users/.../README.md
+                # 使用小写 patterns 在 fp_lower 上匹配
+                priority_patterns = [
+                    r'(^|/)readme',         # 任意层级的 README 文件
+                    r'docs/index',
+                    r'docs/overview',
+                    r'docs/getting[-_]start',
+                    r'docs/introduction',
+                    r'getting[-_]started',
+                ]
+                for p in priority_patterns:
+                    if re.search(p, fp_lower):
+                        # 命中优先 pattern，有效优先级大幅提升
+                        if chunk.chunk_type in ("readme", "document"):
+                            effective_type_priority = 1  # 和 function/class 同级
+                        else:
+                            effective_type_priority = 3  # 和 module 同级
+                        source_adjustment = -10
+                        break
+
+                # 降权的源文件（负向加权）
+                if source_adjustment == 0:
+                    depriority_patterns = [
+                        r'contributing',
+                        r'code_of_conduct',
+                        r'security',
+                        r'license',
+                        r'changelog',
+                        r'authors',
+                    ]
+                    for p in depriority_patterns:
+                        if re.search(p, fp_lower):
+                            source_adjustment = +20  # 极大降权
+                            break
+
             # 位置偏好（代码靠前的略优先）
             line_penalty = chunk.start_line / 10000
 
-            return (type_score, -item.score - path_match * 0.5 + line_penalty, chunk.start_line)
+            return (effective_type_priority, -item.score - path_match * 0.5 + line_penalty - tutorial_match + source_adjustment, chunk.start_line)
 
         chunks.sort(key=rerank_key)
         return chunks[:top_k]

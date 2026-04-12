@@ -11,7 +11,7 @@ from src.tools.repo_cloner import RepoCloner
 from src.tools.code_parser import CodeParser, RepoStructure
 from src.tools.github_search import GitHubSearch
 from src.tools.chunker import Chunker, CodeChunk
-from src.tools.rag_pipeline import RAGPipeline, RetrievedChunk, build_index, search
+from src.tools.rag_pipeline import RAGPipeline, RetrievedChunk, build_index, search, detect_tutorial_number, detect_query_intent
 from src.tools.report_generator import ReportGenerator, generate_report, save_report
 from src.models.repo_card import RepoCard
 from src.config import get_llm_config, RAG_TOP_K, RAG_RERANK_TOP_K
@@ -167,8 +167,17 @@ class CodeAnalysisAgent:
         if not session.is_indexed or session.rag_pipeline is None:
             raise ValueError("RAG 索引未构建，请先调用 build_rag_index()")
 
-        # Step 1: 检索相关代码块
-        retrieved = session.rag_pipeline.search(question, top_k=top_k * 2)
+        # Step 1: 检测 query intent 和 tutorial 编号
+        query_intent = detect_query_intent(question)
+        tutorial_hint = detect_tutorial_number(question)
+
+        if tutorial_hint:
+            logger.info(f"检测到 tutorial 编号: {tutorial_hint}，增强检索")
+        if query_intent != "general":
+            logger.info(f"检测到 query intent: {query_intent}，应用路由策略")
+
+        # Step 2: 检索相关代码块
+        retrieved = session.rag_pipeline.search(question, top_k=top_k * 2, tutorial_hint=tutorial_hint)
 
         if not retrieved:
             return {
@@ -177,18 +186,28 @@ class CodeAnalysisAgent:
                 "sources": [],
             }
 
-        # Step 2: 重排序
-        reranked = session.rag_pipeline.rerank(question, retrieved, top_k=top_k)
+        # Step 3: 重排序
+        reranked = session.rag_pipeline.rerank(
+            question, retrieved, top_k=top_k,
+            tutorial_hint=tutorial_hint, query_intent=query_intent
+        )
 
-        # Step 3: 构建上下文
+        # Step 4: 去重（同一文件多个片段时合并）
         context_chunks = [r.chunk for r in reranked]
-        context = self._build_context(context_chunks)
+        deduplicated_map = {}  # file_path -> first chunk with that path
+        for chunk in context_chunks:
+            if chunk.file_path not in deduplicated_map:
+                deduplicated_map[chunk.file_path] = chunk
+        deduplicated_chunks = list(deduplicated_map.values())
 
-        # Step 4: 调用 LLM 生成答案
+        # Step 5: 构建上下文（使用去重后的 chunks）
+        context = self._build_context(deduplicated_chunks)
+
+        # Step 6: 调用 LLM 生成答案
         answer = self._generate_answer(question, context)
 
-        # Step 5: 验证引用（检查代码片段是否真实存在）
-        verified_sources = self._verify_sources(context_chunks, session.repo_path)
+        # Step 7: 验证引用（检查代码片段是否真实存在）
+        verified_sources = self._verify_sources(deduplicated_chunks, session.repo_path)
 
         logger.info(f"问答完成，找到 {len(verified_sources)} 个引用")
 
@@ -199,12 +218,32 @@ class CodeAnalysisAgent:
         }
 
     def _build_context(self, chunks: List[CodeChunk]) -> str:
-        """构建 LLM 上下文"""
+        """构建 LLM 上下文（带去重）"""
+        # 按文件路径去重，保留同一个文件的多个片段但标注来源
+        seen_files = {}  # file_path -> list of (start_line, end_line, chunk_index)
+
+        # 去重：合并同一文件的多个片段
+        deduplicated_chunks = []
+        for chunk in chunks:
+            file_path = chunk.file_path
+            if file_path in seen_files:
+                # 追加片段信息
+                seen_files[file_path].append(chunk)
+            else:
+                seen_files[file_path] = [chunk]
+                deduplicated_chunks.append(chunk)
+
         parts = []
 
-        for i, chunk in enumerate(chunks, 1):
+        for i, chunk in enumerate(deduplicated_chunks, 1):
+            # 显示 heading_path 如果存在
+            location = f"文件: {chunk.file_path}"
+            if chunk.heading_path:
+                location += f" ({chunk.heading_path})"
+            location += f" (行 {chunk.start_line}-{chunk.end_line})"
+
             part = f"""--- 代码片段 {i} ---
-文件: {chunk.file_path} (行 {chunk.start_line}-{chunk.end_line})
+{location}
 类型: {chunk.chunk_type}
 名称: {chunk.name}
 签名: {chunk.signature}

@@ -7,7 +7,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 from src.tools.code_parser import CodeParser, FileType, ParsedFile
@@ -26,9 +26,18 @@ class CodeChunk:
     end_line: int                 # 结束行号
 
     # 元数据
-    chunk_type: str = "unknown"   # 类型：function, class, module, config, test
+    chunk_type: str = "unknown"   # 类型：function, class, module, config, test, readme, tutorial_markdown, notebook_markdown, notebook_code, document
     name: str = ""                # 名称（如函数名、类名）
     language: Optional[str] = None
+
+    # 语义路径（用于教程仓库的标题层级，如 "Tutorial 8 > Complex Workflow"）
+    heading_path: str = ""
+
+    # Notebook 专用
+    notebook_cell_index: Optional[int] = None  # cell 序号
+
+    # 代码切片专用
+    imports: List[str] = field(default_factory=list)  # 导入语句（轻量提取）
 
     # 上下文（用于召回后验证）
     context_before: str = ""       # 前 n 行上下文
@@ -56,6 +65,9 @@ class CodeChunk:
             "chunk_type": self.chunk_type,
             "name": self.name,
             "language": self.language,
+            "heading_path": self.heading_path,
+            "notebook_cell_index": self.notebook_cell_index,
+            "imports": self.imports,
             "context_before": self.context_before,
             "context_after": self.context_after,
             "signature": self.signature,
@@ -71,9 +83,51 @@ class Chunker:
     # 上下文行数
     CONTEXT_LINES = 3
 
+    # 忽略的文件名模式（系统派生产物）
+    DERIVED_ARTIFACT_NAMES = {
+        "analysis_report.md",
+        "analysis_report.json",
+        "search_results.json",
+        "repo_cards.json",
+    }
+
+    # 忽略的目录模式（系统输出目录）
+    DERIVED_ARTIFACT_DIRS = {
+        ".claude-plugin",
+        ".codex-plugin",
+        "mempalace",
+    }
+
     def __init__(self):
         """初始化切片器"""
         self.parser = CodeParser()
+
+    def is_derived_artifact(self, file_path: Path) -> bool:
+        """
+        判断文件是否为系统派生产物
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            True 如果是派生产物，应被跳过
+        """
+        name = file_path.name.lower()
+
+        # 文件名黑名单
+        if name in self.DERIVED_ARTIFACT_NAMES:
+            return True
+
+        # analysis_report_*.md 模式
+        if name.startswith("analysis_report") and name.endswith(".md"):
+            return True
+
+        # 目录黑名单
+        for part in file_path.parts:
+            if part in self.DERIVED_ARTIFACT_DIRS:
+                return True
+
+        return False
 
     def chunk_file(self, file_path: str, parsed_file: Optional[ParsedFile] = None) -> List[CodeChunk]:
         """
@@ -87,6 +141,7 @@ class Chunker:
             CodeChunk 列表
         """
         file_path = Path(file_path)
+        filename = file_path.name
 
         # 分类文件
         file_type, language = self.parser.classifier.classify(str(file_path))
@@ -95,7 +150,19 @@ class Chunker:
         if file_type == FileType.CONFIG:
             return self._chunk_config(file_path, language)
 
-        # 文档文件处理
+        # Notebook 处理
+        if file_type == FileType.NOTEBOOK:
+            return self._chunk_notebook(file_path)
+
+        # Markdown 处理
+        if file_type == FileType.MARKDOWN:
+            # 区分 README 和教程文档
+            if filename.lower().startswith("readme"):
+                return self._chunk_markdown(file_path, chunk_type="readme")
+            else:
+                return self._chunk_markdown(file_path, chunk_type="tutorial_markdown")
+
+        # 文档文件处理（.txt, .rst 等非 Markdown 文档）
         if file_type == FileType.DOCUMENT:
             return self._chunk_document(file_path)
 
@@ -143,6 +210,227 @@ class Chunker:
         except Exception as e:
             logger.debug(f"文档切片失败 {file_path}: {e}")
             return []
+
+    def _chunk_markdown(self, file_path: Path, chunk_type: str = "tutorial_markdown") -> List[CodeChunk]:
+        """
+        Markdown 文件切片（按标题层级切分）
+
+        Args:
+            file_path: 文件路径
+            chunk_type: chunk 类型（readme, tutorial_markdown）
+
+        Returns:
+            CodeChunk 列表
+        """
+        import re
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            lines = content.splitlines()
+            chunks = []
+
+            # 标题行模式：# ## ###
+            heading_pattern = re.compile(r'^(#{1,6})\s+(.+)$')
+
+            # 找到所有标题的位置和层级
+            headings = []
+            for i, line in enumerate(lines):
+                match = heading_pattern.match(line)
+                if match:
+                    level = len(match.group(1))
+                    title = match.group(2).strip()
+                    headings.append({
+                        "line": i + 1,
+                        "level": level,
+                        "title": title,
+                    })
+
+            # 如果没有标题，整个文件作为一个 chunk
+            if not headings:
+                return [CodeChunk(
+                    chunk_id=self._generate_chunk_id(file_path, chunk_type, 1),
+                    content=content,
+                    file_path=str(file_path),
+                    start_line=1,
+                    end_line=len(lines),
+                    chunk_type=chunk_type,
+                    name=file_path.stem,
+                    heading_path="",
+                )]
+
+            # 按标题切分
+            for i, heading in enumerate(headings):
+                start_line = heading["line"]
+                # 计算 heading_path（从最高级标题到当前标题的路径）
+                heading_path_parts = []
+                for h in headings[:i + 1]:
+                    heading_path_parts.append(h["title"])
+                heading_path = " > ".join(heading_path_parts)
+
+                # 确定结束行（下一个标题前一行，或文件末尾）
+                if i + 1 < len(headings):
+                    end_line = headings[i + 1]["line"] - 1
+                else:
+                    end_line = len(lines)
+
+                # 提取内容
+                section_lines = lines[start_line - 1:end_line]
+                section_content = "\n".join(section_lines)
+
+                # 跳过太短的章节
+                if len(section_lines) < 2:
+                    continue
+
+                chunks.append(CodeChunk(
+                    chunk_id=self._generate_chunk_id(file_path, chunk_type, start_line),
+                    content=section_content,
+                    file_path=str(file_path),
+                    start_line=start_line,
+                    end_line=end_line,
+                    chunk_type=chunk_type,
+                    name=heading["title"],
+                    heading_path=heading_path,
+                ))
+
+            return chunks
+
+        except Exception as e:
+            logger.debug(f"Markdown 切片失败 {file_path}: {e}")
+            return []
+
+    def _chunk_notebook(self, file_path: Path) -> List[CodeChunk]:
+        """
+        Notebook 文件切片（按 cell 切分）
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            CodeChunk 列表
+        """
+        import re
+        import json
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                nb = json.load(f)
+
+            chunks = []
+            cells = nb.get("cells", [])
+
+            # 跟踪当前标题路径（用于 markdown cell 的 heading_path）
+            current_heading_path = file_path.stem  # 默认用文件名
+
+            # 标题模式：# ## ###（用于跟踪当前标题）
+            heading_pattern = re.compile(r'^(#{1,6})\s+(.+)$')
+
+            for cell_idx, cell in enumerate(cells):
+                cell_type = cell.get("cell_type", "")
+                source = cell.get("source", [])
+                if isinstance(source, list):
+                    source = "".join(source)
+                elif not isinstance(source, str):
+                    source = str(source)
+
+                if not source.strip():
+                    continue
+
+                lines = source.splitlines()
+                start_line = cell.get("metadata", {}).get("start_line", 1)
+                end_line = start_line + len(lines) - 1
+
+                if cell_type == "markdown":
+                    # 检查是否有标题
+                    for line in lines:
+                        match = heading_pattern.match(line)
+                        if match:
+                            level = len(match.group(1))
+                            title = match.group(2).strip()
+                            # 构建 heading_path（只保留同级及更高级标题）
+                            if level == 1:
+                                current_heading_path = title
+                            else:
+                                current_heading_path = f"{current_heading_path} > {title}"
+                            break
+
+                    chunks.append(CodeChunk(
+                        chunk_id=self._generate_chunk_id(file_path, "notebook_markdown", start_line),
+                        content=source,
+                        file_path=str(file_path),
+                        start_line=start_line,
+                        end_line=end_line,
+                        chunk_type="notebook_markdown",
+                        name=self._extract_title_from_markdown(source) or f"Cell {cell_idx}",
+                        heading_path=current_heading_path,
+                        notebook_cell_index=cell_idx,
+                    ))
+
+                elif cell_type == "code":
+                    # 提取 imports（轻量正则）
+                    imports = self._extract_imports_from_code(source)
+
+                    # 确定代码语言（通常从 notebook metadata 获取）
+                    language = "python"  # Notebook 默认 Python
+
+                    chunks.append(CodeChunk(
+                        chunk_id=self._generate_chunk_id(file_path, "notebook_code", start_line),
+                        content=source,
+                        file_path=str(file_path),
+                        start_line=start_line,
+                        end_line=end_line,
+                        chunk_type="notebook_code",
+                        name=f"Code Cell {cell_idx}",
+                        heading_path=current_heading_path,
+                        notebook_cell_index=cell_idx,
+                        imports=imports,
+                        language=language,
+                    ))
+
+            return chunks
+
+        except Exception as e:
+            logger.debug(f"Notebook 切片失败 {file_path}: {e}")
+            return []
+
+    def _extract_title_from_markdown(self, content: str) -> str:
+        """从 markdown 内容中提取第一个标题"""
+        import re
+        match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    def _extract_imports_from_code(self, code: str) -> List[str]:
+        """
+        从代码中提取 import 语句（轻量正则，不上 tree-sitter）
+
+        支持：
+        - import xxx
+        - from xxx import yyy
+        - require(xxx)  # Node.js
+        """
+        import re
+
+        imports = []
+
+        # import xxx
+        import_pattern = re.compile(r'^import\s+([^\s;#]+)', re.MULTILINE)
+        for match in import_pattern.finditer(code):
+            imports.append(match.group(0).strip())
+
+        # from xxx import yyy
+        from_import_pattern = re.compile(r'^from\s+([^\s]+)\s+import', re.MULTILINE)
+        for match in from_import_pattern.finditer(code):
+            imports.append(match.group(0).strip())
+
+        # require(xxx)
+        require_pattern = re.compile(r'require\s*\(\s*["\']([^"\']+)["\']\s*\)')
+        for match in require_pattern.finditer(code):
+            imports.append(match.group(0).strip())
+
+        return imports
 
     def _chunk_source_code(
         self,
@@ -572,7 +860,7 @@ class Chunker:
         unique_id = uuid.uuid4().hex[:12]
         return f"{unique_id}_{file_path.name}_{chunk_type}_{line}"
 
-    def chunk_directory(self, dir_path: str, max_file_size: int = 500_000) -> List[CodeChunk]:
+    def chunk_directory(self, dir_path: str, max_file_size: int = 500_000) -> Tuple[List[CodeChunk], Dict[str, Any]]:
         """
         切片整个目录
 
@@ -581,10 +869,20 @@ class Chunker:
             max_file_size: 最大文件大小（字节），超过则跳过
 
         Returns:
-            所有文件的 Chunk 列表
+            (所有文件的 Chunk 列表, 统计信息字典)
+            统计信息包含: total_chunks, markdown_files, notebook_files, notebook_cells, tutorial_sections
         """
         all_chunks = []
         seen_ids = set()  # 用于去重
+
+        # 统计信息
+        stats = {
+            "total_chunks": 0,
+            "markdown_files": 0,
+            "notebook_files": 0,
+            "notebook_cells": 0,
+            "tutorial_sections": 0,
+        }
 
         for root, dirs, files in os.walk(dir_path):
             # 过滤忽略的目录
@@ -596,6 +894,11 @@ class Chunker:
             for filename in files:
                 file_path = Path(root) / filename
 
+                # 跳过系统派生产物
+                if self.is_derived_artifact(file_path):
+                    logger.info(f"跳过派生产物: {file_path}")
+                    continue
+
                 # 跳过太大的文件
                 try:
                     if file_path.stat().st_size > max_file_size:
@@ -604,15 +907,30 @@ class Chunker:
                 except Exception:
                     pass
 
+                # 统计文件类型
+                file_type, _ = self.parser.classifier.classify(str(file_path))
+                if file_type == FileType.MARKDOWN:
+                    stats["markdown_files"] += 1
+                elif file_type == FileType.NOTEBOOK:
+                    stats["notebook_files"] += 1
+
                 chunks = self.chunk_file(str(file_path))
-                # 去重：跳过相同 chunk_id 的 chunk
+
+                # 更新统计
                 for chunk in chunks:
                     if chunk.chunk_id not in seen_ids:
                         seen_ids.add(chunk.chunk_id)
                         all_chunks.append(chunk)
 
-        logger.info(f"目录切片完成: {dir_path}，共 {len(all_chunks)} 个 chunks")
-        return all_chunks
+                        if chunk.chunk_type == "notebook_code":
+                            stats["notebook_cells"] += 1
+                        elif chunk.chunk_type in ("tutorial_markdown", "readme"):
+                            stats["tutorial_sections"] += 1
+
+        stats["total_chunks"] = len(all_chunks)
+
+        logger.info(f"目录切片完成: {dir_path}，共 {len(all_chunks)} 个 chunks，统计: {stats}")
+        return all_chunks, stats
 
 
 # 便捷函数

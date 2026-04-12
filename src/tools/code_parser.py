@@ -23,6 +23,8 @@ class FileType(Enum):
     DOCUMENT = "document"
     BUILD = "build"
     DATA = "data"
+    NOTEBOOK = "notebook"       # Jupyter Notebook (.ipynb)
+    MARKDOWN = "markdown"       # Markdown 文档 (.md)
     OTHER = "other"
 
 
@@ -148,7 +150,15 @@ class FileClassifier:
             if pattern in name:
                 return FileType.TEST, None
 
-        # 检查是否文档
+        # 检查是否 Notebook
+        if ext == ".ipynb":
+            return FileType.NOTEBOOK, "python"  # Notebook 通常用 Python
+
+        # 检查是否 Markdown
+        if ext == ".md":
+            return FileType.MARKDOWN, None
+
+        # 检查是否文档（非 Markdown）
         if ext in self.DOC_PATTERNS or name in self.DOC_PATTERNS:
             return FileType.DOCUMENT, None
 
@@ -404,18 +414,16 @@ class CodeParser:
                     if language:
                         by_language[language] = by_language.get(language, 0) + 1
 
-                    # 跳过非源代码文件（用于行数统计）
-                    if file_type != FileType.SOURCE_CODE:
-                        continue
-
-                    # 读取文件内容
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                            line_count = len(content.splitlines())
-                            total_lines += line_count
-                    except Exception:
-                        line_count = 0
+                    # 读取文件内容（源代码、Notebook、Markdown 都统计行数）
+                    line_count = 0
+                    if file_type in (FileType.SOURCE_CODE, FileType.NOTEBOOK, FileType.MARKDOWN):
+                        try:
+                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                                line_count = len(content.splitlines())
+                                total_lines += line_count
+                        except Exception:
+                            pass
 
                     files.append(ParsedFile(
                         path=rel_path,
