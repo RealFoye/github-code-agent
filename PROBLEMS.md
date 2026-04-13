@@ -970,6 +970,81 @@ fp_lower = '/a/b/readme_cn.md'        # 小写
 
 ---
 
+### 问题 26：类提取功能缺失 ✅ 已修复
+
+**问题描述：**
+- `ASTParser` 有 `extract_functions()` 方法，但没有 `extract_classes()` 方法
+- 导致 `CodeParser.parse_file()` 返回的 `classes` 字段始终为空
+
+**解决方法：**
+
+1. **新增 `extract_classes()` 方法**
+   - 支持 Python/JavaScript/TypeScript/Go
+   - Python：使用 tree-sitter query 提取 `class_definition` 节点
+   - 提取类名、基类、行号范围、docstring
+
+2. **新增辅助方法**
+   - `_extract_python_signature()`：提取函数参数签名
+   - `_extract_python_docstring()`：提取 docstring
+   - `_extract_python_classes()`：Python 类提取
+   - `_extract_js_classes()`：JS 类提取
+   - `_extract_go_classes()`：Go 类提取
+
+3. **更新 `parse_file()`**
+   - 解析 AST 后同时调用 `extract_functions()` 和 `extract_classes()`
+
+**发生时间：** 2026/04/13
+
+---
+
+### 问题 27：函数签名和 docstring 未提取 ✅ 已修复
+
+**问题描述：**
+- `CodeChunk.signature` 和 `CodeChunk.docstring` 字段存在但始终为空
+- `_chunk_source_code()` 没有从 AST 中提取签名和文档字符串
+
+**解决方法：**
+
+1. **增强 `_extract_python_functions()`**
+   - 提取函数参数签名（`parameters` 节点）
+   - 提取 docstring（`expression_statement` 中的 string 节点）
+
+2. **更新 chunker.py 中的 definitions**
+   - 函数/类定义现在携带 `signature` 和 `docstring` 信息
+   - `CodeChunk` 创建时填充这些字段
+
+**发生时间：** 2026/04/13
+
+---
+
+### 问题 28：代码片段真实性校验不完整 ✅ 已修复
+
+**问题描述：**
+- `_verify_sources()` 只检查行号范围是否在文件内
+- 不校验检索返回的 `chunk.content` 是否与文件中实际内容一致
+- LLM 可能基于不存在的代码片段回答
+
+**解决方法：**
+
+1. **新增 `_content_matches()` 精确匹配**
+   - 考虑换行符差异（\n vs \r\n）
+   - 考虑尾部空白差异
+   - 标准化后比较
+
+2. **新增 `_content_matches_lenient()` 宽松匹配**
+   - 处理切片边界略有不同的情况
+   - 逐行比较，跳过空白行差异
+   - 70% 匹配阈值
+
+3. **增强 `_verify_sources()`**
+   - 精确匹配优先
+   - 不匹配时尝试宽松匹配
+   - 仍不匹配的 chunk 标记 `verified=False` 并记录警告
+
+**发生时间：** 2026/04/13
+
+---
+
 ## 设计讨论记录（2026/04/12）
 
 > **写给后来看这份文档的人：**
