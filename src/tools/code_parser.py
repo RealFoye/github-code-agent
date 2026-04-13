@@ -229,6 +229,141 @@ class ASTParser:
             return self._extract_go_functions(ast)
         return []
 
+    def extract_classes(self, ast: Any, language: str) -> List[Dict[str, Any]]:
+        """从 AST 提取类信息"""
+        if language == "python":
+            return self._extract_python_classes(ast)
+        elif language == "javascript" or language == "typescript":
+            return self._extract_js_classes(ast)
+        elif language == "go":
+            return self._extract_go_classes(ast)
+        return []
+
+    def _extract_python_classes(self, ast: Any) -> List[Dict[str, Any]]:
+        """提取 Python 类"""
+        classes = []
+        if ast is None:
+            return classes
+
+        try:
+            from tree_sitter_languages import get_language
+
+            language = get_language("python")
+
+            # 查找类定义
+            query = language.query("""
+                (class_definition
+                    name: (identifier) @name
+                    superclasses: (argument_list)? @bases
+                    body: (block) @body) @class
+            """)
+
+            captures = query.captures(ast.root_node)
+            for node, capture_type in captures:
+                if capture_type == "name":
+                    class_node = node.parent
+                    if class_node and class_node.type == "class_definition":
+                        start = class_node.start_point
+                        end = class_node.end_point
+
+                        # 提取 docstring
+                        docstring = self._extract_python_docstring(class_node, language)
+
+                        # 提取基类
+                        bases = []
+                        for child in class_node.children:
+                            if child.type == "argument_list":
+                                for c in child.children:
+                                    if c.type == "identifier":
+                                        bases.append(c.text.decode("utf8"))
+
+                        classes.append({
+                            "name": node.text.decode("utf8"),
+                            "start_line": start[0] + 1,
+                            "end_line": end[0] + 1,
+                            "type": "class",
+                            "bases": bases,
+                            "docstring": docstring,
+                        })
+        except Exception as e:
+            logger.debug(f"提取 Python 类失败: {e}")
+
+        return classes
+
+    def _extract_js_classes(self, ast: Any) -> List[Dict[str, Any]]:
+        """提取 JavaScript/TypeScript 类"""
+        classes = []
+        if ast is None:
+            return classes
+
+        try:
+            from tree_sitter_languages import get_language
+
+            language = get_language("javascript")
+
+            # 查找类定义
+            query = language.query("""
+                (class_declaration
+                    name: (identifier) @name
+                    body: (class_body) @body) @class
+            """)
+
+            captures = query.captures(ast.root_node)
+            for node, capture_type in captures:
+                if capture_type == "name":
+                    class_node = node.parent
+                    if class_node and class_node.type == "class_declaration":
+                        start = class_node.start_point
+                        end = class_node.end_point
+
+                        classes.append({
+                            "name": node.text.decode("utf8"),
+                            "start_line": start[0] + 1,
+                            "end_line": end[0] + 1,
+                            "type": "class",
+                        })
+        except Exception as e:
+            logger.debug(f"提取 JS 类失败: {e}")
+
+        return classes
+
+    def _extract_go_classes(self, ast: Any) -> List[Dict[str, Any]]:
+        """提取 Go 类型/结构体"""
+        classes = []
+        if ast is None:
+            return classes
+
+        try:
+            from tree_sitter_languages import get_language
+
+            language = get_language("go")
+
+            # 查找类型声明（struct 或 interface）
+            query = language.query("""
+                (type_declaration
+                    name: (type_identifier) @name
+                    body: (type_spec) @spec) @type
+            """)
+
+            captures = query.captures(ast.root_node)
+            for node, capture_type in captures:
+                if capture_type == "name":
+                    type_node = node.parent
+                    if type_node and type_node.type == "type_declaration":
+                        start = type_node.start_point
+                        end = type_node.end_point
+
+                        classes.append({
+                            "name": node.text.decode("utf8"),
+                            "start_line": start[0] + 1,
+                            "end_line": end[0] + 1,
+                            "type": "class",
+                        })
+        except Exception as e:
+            logger.debug(f"提取 Go 类失败: {e}")
+
+        return classes
+
     def _extract_python_functions(self, ast: Any) -> List[Dict[str, Any]]:
         """提取 Python 函数"""
         functions = []
@@ -257,16 +392,84 @@ class ASTParser:
                     if func_node and func_node.type == "function_definition":
                         start = func_node.start_point
                         end = func_node.end_point
+
+                        # 提取签名（参数）
+                        params_node = None
+                        for child in func_node.children:
+                            if child.type == "parameters":
+                                params_node = child
+                                break
+                        signature = self._extract_python_signature(params_node, language) if params_node else ""
+
+                        # 提取 docstring
+                        docstring = self._extract_python_docstring(func_node, language)
+
                         functions.append({
                             "name": node.text.decode("utf8"),
                             "start_line": start[0] + 1,
                             "end_line": end[0] + 1,
                             "type": "function",
+                            "signature": signature,
+                            "docstring": docstring,
                         })
         except Exception as e:
             logger.debug(f"提取 Python 函数失败: {e}")
 
         return functions
+
+    def _extract_python_signature(self, params_node, language) -> str:
+        """提取 Python 函数签名（参数列表）"""
+        if params_node is None:
+            return "()"
+
+        try:
+            parts = []
+            for child in params_node.children:
+                if child.type == "identifier":
+                    parts.append(child.text.decode("utf8"))
+                elif child.type == "default_parameter":
+                    # 处理有默认值的参数：a=1
+                    name_node = None
+                    for c in child.children:
+                        if c.type == "identifier":
+                            name_node = c
+                            break
+                    if name_node:
+                        parts.append(name_node.text.decode("utf8"))
+                elif child.type == "list_splat_pattern" or child.type == "dictionary_splat_pattern":
+                    # 处理 *args 和 **kwargs
+                    parts.append(child.text.decode("utf8"))
+            return "(" + ", ".join(parts) + ")"
+        except Exception:
+            return "()"
+
+    def _extract_python_docstring(self, func_node, language) -> str:
+        """提取 Python docstring"""
+        try:
+            body = None
+            for child in func_node.children:
+                if child.type == "block":
+                    body = child
+                    break
+
+            if body is None or len(body.children) == 0:
+                return ""
+
+            first_stmt = body.children[0]
+            if first_stmt.type == "expression_statement":
+                expr = first_stmt.children[0]
+                if expr.type == "string":
+                    docstring = expr.text.decode("utf8")
+                    # 去除三引号或普通引号
+                    docstring = docstring.strip()
+                    if docstring.startswith('"""') or docstring.startswith("'''"):
+                        docstring = docstring[3:-3].strip()
+                    elif docstring.startswith('"') or docstring.startswith("'"):
+                        docstring = docstring[1:-1].strip()
+                    return docstring
+            return ""
+        except Exception:
+            return ""
 
     def _extract_js_functions(self, ast: Any) -> List[Dict[str, Any]]:
         """提取 JavaScript/TypeScript 函数"""
@@ -486,6 +689,7 @@ class CodeParser:
                 # 提取函数和类
                 if ast:
                     result.functions = self.ast_parser.extract_functions(ast, language)
+                    result.classes = self.ast_parser.extract_classes(ast, language)
 
         except Exception as e:
             logger.debug(f"解析文件失败 {file_path}: {e}")

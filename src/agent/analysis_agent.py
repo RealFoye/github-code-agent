@@ -394,25 +394,84 @@ class CodeAnalysisAgent:
         for chunk in chunks:
             file_path = chunk.file_path
 
-            # 检查文件是否存在
+            # 检查文件路径是否在仓库内
             if not file_path.startswith(repo_path):
                 continue
 
-            # 检查文件是否可读
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.readlines()
 
                 # 验证行号范围
-                if 1 <= chunk.start_line <= len(lines) and 1 <= chunk.end_line <= len(lines):
+                if not (1 <= chunk.start_line <= len(lines) and 1 <= chunk.end_line <= len(lines)):
+                    logger.debug(f"行号范围无效: {file_path} ({chunk.start_line}-{chunk.end_line})")
+                    continue
+
+                # 验证内容一致性：检查 chunk.content 是否与文件中实际内容匹配
+                actual_content = "".join(lines[chunk.start_line - 1:chunk.end_line])
+
+                # 内容匹配校验（允许尾部空白差异）
+                if self._content_matches(chunk.content, actual_content):
                     verified.append({
                         "chunk": chunk,
                         "verified": True,
                     })
-            except Exception:
-                pass
+                else:
+                    # 内容不匹配，尝试用更宽松的校验
+                    if self._content_matches_lenient(chunk.content, actual_content):
+                        logger.debug(f"内容部分匹配（宽松校验）: {file_path} ({chunk.start_line}-{chunk.end_line})")
+                        verified.append({
+                            "chunk": chunk,
+                            "verified": True,  # 宽松校验通过也算真实
+                        })
+                    else:
+                        logger.warning(f"代码片段内容不匹配: {file_path} ({chunk.start_line}-{chunk.end_line})")
+                        # 内容严重不匹配的 chunk 仍然加入，但标记 verified=False
+                        verified.append({
+                            "chunk": chunk,
+                            "verified": False,
+                        })
+
+            except Exception as e:
+                logger.debug(f"验证代码片段失败: {file_path}, {e}")
 
         return verified
+
+    def _content_matches(self, chunk_content: str, actual_content: str) -> bool:
+        """
+        精确匹配校验：chunk.content 与文件中实际内容是否一致
+
+        考虑因素：
+        - 换行符差异（\n vs \r\n）
+        - 尾部空白差异
+        """
+        # 标准化空白字符
+        normalized_chunk = chunk_content.rstrip()
+        normalized_actual = actual_content.rstrip()
+
+        return normalized_chunk == normalized_actual
+
+    def _content_matches_lenient(self, chunk_content: str, actual_content: str) -> bool:
+        """
+        宽松匹配校验：用于处理切片边界略有不同的情况
+
+        策略：逐行比较，跳过空白行差异
+        """
+        chunk_lines = [l.rstrip() for l in chunk_content.splitlines() if l.strip()]
+        actual_lines = [l.rstrip() for l in actual_content.splitlines() if l.strip()]
+
+        if not chunk_lines or not actual_lines:
+            return False
+
+        # 检查关键行是否匹配（忽略顺序和完全空行的差异）
+        chunk_set = set(chunk_lines)
+        actual_set = set(actual_lines)
+
+        # 如果有超过 50% 的 chunk 行在 actual 中找到，认为匹配
+        matching = sum(1 for cl in chunk_lines if cl in actual_set)
+        match_ratio = matching / len(chunk_lines) if chunk_lines else 0
+
+        return match_ratio >= 0.7
 
     def generate_report(
         self,

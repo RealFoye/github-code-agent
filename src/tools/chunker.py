@@ -467,22 +467,28 @@ class Chunker:
             # 按行号排序所有定义
             definitions = []
 
-            # 添加函数
+            # 添加函数（包含签名和 docstring）
             for func in functions:
                 definitions.append({
                     "type": "function",
                     "name": func.get("name", ""),
                     "start": func.get("start_line", 1) - 1,
                     "end": func.get("end_line", 1),
+                    "signature": func.get("signature", ""),
+                    "docstring": func.get("docstring", ""),
                 })
 
-            # 添加类
+            # 添加类（包含 docstring）
             for cls in classes:
+                bases = cls.get("bases", [])
+                sig = cls.get("name", "") + "(" + ", ".join(bases) + ")" if bases else cls.get("name", "")
                 definitions.append({
                     "type": "class",
                     "name": cls.get("name", ""),
                     "start": cls.get("start_line", 1) - 1,
                     "end": cls.get("end_line", 1),
+                    "signature": sig,
+                    "docstring": cls.get("docstring", ""),
                 })
 
             # 按起始行排序
@@ -526,6 +532,8 @@ class Chunker:
                     chunk_type=chunk_type,
                     name=name,
                     language=language,
+                    signature=defn.get("signature", ""),
+                    docstring=defn.get("docstring", ""),
                     context_before=context_before,
                     context_after=context_after,
                 ))
